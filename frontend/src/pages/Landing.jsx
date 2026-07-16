@@ -29,7 +29,7 @@ export default function Landing() {
           <div className="lg:col-span-7 animate-fade-up">
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-edge bg-white text-xs text-subink mb-6">
               <span className="w-1.5 h-1.5 rounded-full bg-terracotta" />
-              Built for Etsy sellers who'd rather be making
+              Built for Etsy sellers who’d rather be making
             </div>
             <h1 className="font-serif text-4xl sm:text-5xl lg:text-6xl text-ink leading-[1.05]">
               Etsy listings that <span className="text-terracotta">actually rank</span>.<br className="hidden sm:block" />
