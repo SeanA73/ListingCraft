@@ -9,7 +9,7 @@ import ScoreRing from "@/components/ScoreRing";
 import { toast } from "sonner";
 import {
   Loader2, RotateCw, Upload, X, Sparkles, Check, Save,
-  ChevronDown, ChevronUp,
+  ChevronDown, ChevronUp, Rocket,
 } from "lucide-react";
 
 const TONES = [
@@ -300,6 +300,13 @@ export default function Generator() {
                         className="text-xs px-3 py-1.5 rounded-full bg-teal text-white hover:bg-tealDark transition-colors duration-200"
                       >
                         Copy All (Etsy order)
+                      </button>
+                      <button
+                        onClick={() => navigate(`/publish/${listing.listing_id}`)}
+                        data-testid="publish-to-etsy-button"
+                        className="text-xs px-3 py-1.5 rounded-full bg-terracotta text-white hover:bg-terracottaDark transition-colors duration-200 inline-flex items-center gap-1.5"
+                      >
+                        <Rocket className="w-3.5 h-3.5" /> Publish to Etsy
                       </button>
                     </div>
                     <ul className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1.5 text-sm">

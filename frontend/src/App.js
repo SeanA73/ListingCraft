@@ -16,6 +16,7 @@ import Terms from "@/pages/Terms";
 import Privacy from "@/pages/Privacy";
 import AuthCallback from "@/pages/AuthCallback";
 import CheckoutSuccess from "@/pages/CheckoutSuccess";
+import PublishGuide from "@/pages/PublishGuide";
 import ProtectedRoute from "@/components/ProtectedRoute";
 
 function AppRouter() {
@@ -37,6 +38,7 @@ function AppRouter() {
       <Route path="/generator" element={<ProtectedRoute><Generator /></ProtectedRoute>} />
       <Route path="/generator/:id" element={<ProtectedRoute><Generator /></ProtectedRoute>} />
       <Route path="/library" element={<ProtectedRoute><Library /></ProtectedRoute>} />
+      <Route path="/publish/:id" element={<ProtectedRoute><PublishGuide /></ProtectedRoute>} />
       <Route path="/account" element={<ProtectedRoute><Account /></ProtectedRoute>} />
     </Routes>
   );

@@ -4,7 +4,7 @@ import Header from "@/components/Header";
 import { api } from "@/lib/api";
 import { toast } from "sonner";
 import { TEST_IDS } from "@/constants/listingIds";
-import { Search, Copy, Trash2, Files } from "lucide-react";
+import { Search, Copy, Trash2, Files, Rocket } from "lucide-react";
 
 export default function Library() {
   const [items, setItems] = useState([]);
@@ -112,6 +112,13 @@ export default function Library() {
                   >
                     <Files className="w-3.5 h-3.5" /> Duplicate
                   </button>
+                  <Link
+                    to={`/publish/${l.listing_id}`}
+                    className="text-xs px-3 py-1.5 rounded-full bg-terracotta text-white hover:bg-terracottaDark transition-colors duration-200 inline-flex items-center gap-1.5"
+                    data-testid={`library-publish-${l.listing_id}`}
+                  >
+                    <Rocket className="w-3.5 h-3.5" /> Publish
+                  </Link>
                   <button
                     onClick={() => remove(l.listing_id)}
                     className="ml-auto text-xs p-1.5 rounded-full border border-edge hover:bg-surfaceCream text-terracotta transition-colors duration-200"

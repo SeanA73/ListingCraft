@@ -213,9 +213,10 @@ export default function Landing() {
             <AccordionItem value="q1">
               <AccordionTrigger className="text-left">Do you connect to my Etsy shop?</AccordionTrigger>
               <AccordionContent className="text-subink">
-                Not yet. Etsy's API requires shop-by-shop approval that most solo sellers can't get. Today,
-                ListingCraft is copy-paste: we make the copy exceptional and one-click. Direct publishing
-                is on the roadmap.
+                Not yet — Etsy's API requires shop-by-shop approval that most solo sellers can't get.
+                What we do have is a <span className="text-terracotta font-medium">guided Publish-to-Etsy mode</span>: we
+                walk you through the Etsy listing form field-by-field with a copy button for each piece.
+                Direct publishing is on the roadmap.
               </AccordionContent>
             </AccordionItem>
             <AccordionItem value="q2">
