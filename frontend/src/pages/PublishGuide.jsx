@@ -27,6 +27,13 @@ export default function PublishGuide() {
   const [loading, setLoading] = useState(true);
   const [stepIndex, setStepIndex] = useState(0);
   const [done, setDone] = useState({}); // { stepKey: true }
+  const startedRef = React.useRef(false);
+
+  // Fire-and-forget analytics; never blocks the UI or throws.
+  const trackEvent = useCallback((eventType, meta = {}) => {
+    api.post("/analytics/event", { event_type: eventType, metadata: { listing_id: id, ...meta } })
+      .catch(() => {});
+  }, [id]);
 
   useEffect(() => {
     (async () => {
@@ -49,6 +56,13 @@ export default function PublishGuide() {
       }
     })();
   }, [id, navigate]);
+
+  // Fire publish_started exactly once per mount, after the listing loads.
+  useEffect(() => {
+    if (!listing || startedRef.current) return;
+    startedRef.current = true;
+    trackEvent("publish_started", { title_len: (listing.generated?.title || "").length });
+  }, [listing, trackEvent]);
 
   const persist = useCallback((nextDone, nextIndex) => {
     localStorage.setItem(STORAGE_KEY(id), JSON.stringify({ done: nextDone, stepIndex: nextIndex }));
@@ -139,6 +153,7 @@ export default function PublishGuide() {
     const next = { ...done, [key]: value };
     setDone(next);
     persist(next, stepIndex);
+    if (value && !done[key]) trackEvent("publish_step_completed", { step: key, index: stepIndex });
   };
   const goto = (i) => {
     if (i < 0 || i >= totalSteps) return;
@@ -151,6 +166,7 @@ export default function PublishGuide() {
       const next = { ...done, [current.key]: true };
       setDone(next);
       persist(next, Math.min(stepIndex + 1, totalSteps - 1));
+      trackEvent("publish_step_completed", { step: current.key, index: stepIndex });
     } else {
       persist(done, Math.min(stepIndex + 1, totalSteps - 1));
     }
@@ -159,6 +175,12 @@ export default function PublishGuide() {
   const goPrev = () => goto(stepIndex - 1);
 
   const finish = () => {
+    const completedCount = Object.values({ ...done, [current.key]: true }).filter(Boolean).length;
+    trackEvent("publish_completed", {
+      steps_completed: completedCount,
+      total_steps: totalSteps,
+      plan: undefined, // backend joins user.plan itself
+    });
     toast.success("Nice work — happy selling!");
     localStorage.removeItem(STORAGE_KEY(id));
     navigate(`/generator/${id}`);

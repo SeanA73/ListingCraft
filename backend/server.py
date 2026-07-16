@@ -545,6 +545,52 @@ async def analytics_event(body: AnalyticsEventRequest, request: Request):
     return {"ok": True}
 
 
+@api.get("/analytics/funnel")
+async def analytics_funnel(request: Request, days: int = 30):
+    """Publish funnel aggregate — for internal product visibility.
+
+    Returns per-plan counts of publish_started vs publish_completed events over
+    the last `days` days, plus the completion rate. Auth-gated so it's not open
+    to the public web.
+    """
+    await require_user(request, db)
+    since = (datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))).isoformat()
+
+    pipeline = [
+        {"$match": {
+            "event_type": {"$in": ["publish_started", "publish_completed"]},
+            "created_at": {"$gte": since},
+        }},
+        {"$lookup": {
+            "from": "users", "localField": "user_id", "foreignField": "user_id", "as": "u",
+        }},
+        {"$addFields": {"plan": {"$ifNull": [{"$arrayElemAt": ["$u.plan", 0]}, "anonymous"]}}},
+        {"$group": {
+            "_id": {"plan": "$plan", "event": "$event_type"},
+            "count": {"$sum": 1},
+        }},
+    ]
+    rows = await db.analytics_events.aggregate(pipeline).to_list(1000)
+
+    # Collapse into {plan: {started, completed, rate}}
+    by_plan: dict = {}
+    for r in rows:
+        plan = r["_id"]["plan"]
+        evt = r["_id"]["event"]
+        by_plan.setdefault(plan, {"started": 0, "completed": 0})
+        key = "started" if evt == "publish_started" else "completed"
+        by_plan[plan][key] = r["count"]
+
+    for plan, v in by_plan.items():
+        v["rate"] = round(v["completed"] / v["started"], 3) if v["started"] else 0.0
+
+    totals = {"started": sum(v["started"] for v in by_plan.values()),
+              "completed": sum(v["completed"] for v in by_plan.values())}
+    totals["rate"] = round(totals["completed"] / totals["started"], 3) if totals["started"] else 0.0
+
+    return {"since": since, "days": days, "totals": totals, "by_plan": by_plan}
+
+
 # =========================================================
 # HEALTH
 # =========================================================
