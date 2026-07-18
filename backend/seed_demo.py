@@ -1,15 +1,18 @@
-"""Seed a demo account with 3 example listings, so the UI never looks empty."""
-import asyncio
+"""Seed a demo account with 3 example listings, so the UI never looks empty.
+
+Idempotent: safe to run repeatedly. The demo user is upserted by email, and the
+example listings are only inserted if the demo user has none yet.
+"""
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
 
 sys.path.insert(0, str(Path(__file__).parent))
 load_dotenv(Path(__file__).parent / ".env")
 
+from db import get_db, one  # noqa
 from models import User, Listing, GeneratedListing, ListingScore  # noqa
 from auth import hash_password  # noqa
 from listing_service import compute_score  # noqa
@@ -154,23 +157,18 @@ EXAMPLES = [
 ]
 
 
-async def main():
-    mongo_url = os.environ["MONGO_URL"]
-    db_name = os.environ["DB_NAME"]
-    client = AsyncIOMotorClient(mongo_url)
-    db = client[db_name]
+def main():
+    db = get_db()
 
-    existing = await db.users.find_one({"email": DEMO_EMAIL}, {"_id": 0})
+    existing = one(db.table("users").select("*").eq("email", DEMO_EMAIL).limit(1).execute())
     if existing:
         user_id = existing["user_id"]
-        await db.users.update_one({"user_id": user_id}, {"$set": {
+        db.table("users").update({
             "password_hash": hash_password(DEMO_PASSWORD),
             "plan": "pro",
             "plan_expires_at": datetime(2099, 1, 1, tzinfo=timezone.utc).isoformat(),
             "generations_used_this_period": 0,
-        }})
-        # wipe demo listings so we can re-seed cleanly
-        await db.listings.delete_many({"user_id": user_id})
+        }).eq("user_id", user_id).execute()
         print(f"[seed] Reusing user {user_id}")
     else:
         u = User(
@@ -181,9 +179,17 @@ async def main():
             plan="pro",
             plan_expires_at=datetime(2099, 1, 1, tzinfo=timezone.utc).isoformat(),
         )
-        await db.users.insert_one(u.model_dump())
+        db.table("users").insert(u.model_dump()).execute()
         user_id = u.user_id
         print(f"[seed] Created user {user_id}")
+
+    # Idempotent: only seed example listings if this user has none yet.
+    n = db.table("listings").select("listing_id", count="exact").eq(
+        "user_id", user_id
+    ).execute().count or 0
+    if n > 0:
+        print(f"[seed] User already has {n} listing(s); skipping listing seed.")
+        return
 
     for ex in EXAMPLES:
         gen = GeneratedListing(**ex["generated"])
@@ -195,10 +201,9 @@ async def main():
             score=score,
             tone=ex["input"].get("tone", "warm"),
         )
-        await db.listings.insert_one(listing.model_dump())
+        db.table("listings").insert(listing.model_dump()).execute()
     print(f"[seed] Inserted {len(EXAMPLES)} example listings.")
-    client.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

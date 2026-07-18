@@ -7,8 +7,9 @@ import httpx
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi import Depends, HTTPException, Request, Response, status
-from motor.motor_asyncio import AsyncIOMotorDatabase
+from supabase import Client
 
+from db import one
 from models import User, UserPublic
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-me")
@@ -85,9 +86,9 @@ def _read_token(request: Request) -> Optional[str]:
     return None
 
 
-async def _load_user_by_session_token(db: AsyncIOMotorDatabase, token: str) -> Optional[dict]:
-    """Emergent Google flow: token is stored in user_sessions collection."""
-    sess = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
+async def _load_user_by_session_token(db: Client, token: str) -> Optional[dict]:
+    """Emergent Google flow: token is stored in the user_sessions table."""
+    sess = one(db.table("user_sessions").select("*").eq("session_token", token).limit(1).execute())
     if not sess:
         return None
     expires_at = sess.get("expires_at")
@@ -97,25 +98,24 @@ async def _load_user_by_session_token(db: AsyncIOMotorDatabase, token: str) -> O
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     if expires_at and expires_at < datetime.now(timezone.utc):
         return None
-    user = await db.users.find_one({"user_id": sess["user_id"]}, {"_id": 0})
-    return user
+    return one(db.table("users").select("*").eq("user_id", sess["user_id"]).limit(1).execute())
 
 
-async def get_current_user_optional(request: Request, db: AsyncIOMotorDatabase) -> Optional[dict]:
+async def get_current_user_optional(request: Request, db: Client) -> Optional[dict]:
     token = _read_token(request)
     if not token:
         return None
     # 1) JWT (email/password)
     payload = decode_jwt(token)
     if payload and payload.get("user_id"):
-        user = await db.users.find_one({"user_id": payload["user_id"]}, {"_id": 0})
+        user = one(db.table("users").select("*").eq("user_id", payload["user_id"]).limit(1).execute())
         if user:
             return user
     # 2) Emergent session_token
     return await _load_user_by_session_token(db, token)
 
 
-async def require_user(request: Request, db: AsyncIOMotorDatabase) -> dict:
+async def require_user(request: Request, db: Client) -> dict:
     user = await get_current_user_optional(request, db)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")

@@ -3,7 +3,6 @@ from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depend
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 import uuid
@@ -34,11 +33,14 @@ from payments import (  # noqa: E402
 from emergentintegrations.payments.stripe.checkout import (  # noqa: E402
     StripeCheckout, CheckoutSessionRequest,
 )
+from db import get_db, one  # noqa: E402
 
 # --- DB ---
-mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
+# Single shared Supabase client (service role). get_db() fails fast with a clear
+# error at startup if SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are missing. The
+# supabase client is synchronous; endpoints stay `async def` and call it directly
+# (fine for this app's traffic).
+db = get_db()
 
 # --- App ---
 app = FastAPI(title="ListingCraft API")
@@ -63,6 +65,18 @@ def _reset_usage_if_needed(user: dict) -> dict:
     return user
 
 
+def _bump_generations(user_id: str, delta: int) -> None:
+    """Read-modify-write replacement for Mongo's atomic $inc (fine at this traffic)."""
+    row = one(
+        db.table("users").select("generations_used_this_period")
+        .eq("user_id", user_id).limit(1).execute()
+    )
+    current = (row or {}).get("generations_used_this_period", 0) or 0
+    db.table("users").update(
+        {"generations_used_this_period": current + delta}
+    ).eq("user_id", user_id).execute()
+
+
 async def _check_and_increment_quota(user: dict) -> None:
     user = _reset_usage_if_needed(user)
     plan = effective_plan(user)
@@ -73,13 +87,10 @@ async def _check_and_increment_quota(user: dict) -> None:
             status_code=402,
             detail=f"Monthly generation limit reached on the {plan} plan. Upgrade to keep generating.",
         )
-    await db.users.update_one(
-        {"user_id": user["user_id"]},
-        {"$set": {
-            "generations_used_this_period": used + 1,
-            "period_start": user["period_start"],
-        }},
-    )
+    db.table("users").update({
+        "generations_used_this_period": used + 1,
+        "period_start": user["period_start"],
+    }).eq("user_id", user["user_id"]).execute()
 
 
 async def _check_library_cap(user: dict) -> None:
@@ -87,7 +98,9 @@ async def _check_library_cap(user: dict) -> None:
     cap = PLAN_LIMITS[plan]["library_cap"]
     if cap is None:
         return
-    n = await db.listings.count_documents({"user_id": user["user_id"]})
+    n = db.table("listings").select("listing_id", count="exact").eq(
+        "user_id", user["user_id"]
+    ).execute().count or 0
     if n >= cap:
         raise HTTPException(
             status_code=402,
@@ -101,7 +114,7 @@ async def _check_library_cap(user: dict) -> None:
 @api.post("/auth/register")
 async def auth_register(body: RegisterRequest, response: Response):
     email = body.email.lower().strip()
-    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    existing = one(db.table("users").select("*").eq("email", email).limit(1).execute())
     if existing:
         raise HTTPException(status_code=400, detail="An account with that email already exists.")
     user = User(
@@ -110,17 +123,17 @@ async def auth_register(body: RegisterRequest, response: Response):
         password_hash=hash_password(body.password),
         auth_provider="email",
     )
-    await db.users.insert_one(user.model_dump())
+    db.table("users").insert(user.model_dump()).execute()
     token = create_jwt(user.user_id)
     set_auth_cookie(response, token)
-    await _log_event(user.user_id, "signup", {"provider": "email"})
+    _log_event(user.user_id, "signup", {"provider": "email"})
     return {"user": to_public(user.model_dump()).model_dump(), "token": token}
 
 
 @api.post("/auth/login")
 async def auth_login(body: LoginRequest, response: Response):
     email = body.email.lower().strip()
-    user = await db.users.find_one({"email": email}, {"_id": 0})
+    user = one(db.table("users").select("*").eq("email", email).limit(1).execute())
     if not user or not user.get("password_hash"):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
     if not verify_password(body.password, user["password_hash"]):
@@ -142,25 +155,24 @@ async def auth_google_session(body: GoogleSessionRequest, response: Response):
     picture = data.get("picture")
     session_token = data["session_token"]
 
-    user = await db.users.find_one({"email": email}, {"_id": 0})
+    user = one(db.table("users").select("*").eq("email", email).limit(1).execute())
     if not user:
         u = User(email=email, name=name, picture=picture, auth_provider="google")
-        await db.users.insert_one(u.model_dump())
+        db.table("users").insert(u.model_dump()).execute()
         user = u.model_dump()
-        await _log_event(user["user_id"], "signup", {"provider": "google"})
+        _log_event(user["user_id"], "signup", {"provider": "google"})
     else:
-        await db.users.update_one(
-            {"user_id": user["user_id"]},
-            {"$set": {"name": name, "picture": picture}},
-        )
+        db.table("users").update(
+            {"name": name, "picture": picture}
+        ).eq("user_id", user["user_id"]).execute()
 
     # Store session
-    await db.user_sessions.insert_one({
+    db.table("user_sessions").insert({
         "user_id": user["user_id"],
         "session_token": session_token,
         "expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
         "created_at": now_utc_iso(),
-    })
+    }).execute()
 
     response.set_cookie(
         key="session_token",
@@ -181,10 +193,10 @@ async def auth_me(request: Request):
         raise HTTPException(status_code=401, detail="Not authenticated")
     user = _reset_usage_if_needed(user)
     # persist any downgrade / reset
-    await db.users.update_one({"user_id": user["user_id"]}, {"$set": {
+    db.table("users").update({
         "generations_used_this_period": user["generations_used_this_period"],
         "period_start": user["period_start"],
-    }})
+    }).eq("user_id", user["user_id"]).execute()
     pub = to_public(user).model_dump()
     pub["plan"] = effective_plan(user)
     pub["limits"] = PLAN_LIMITS[pub["plan"]]
@@ -195,7 +207,7 @@ async def auth_me(request: Request):
 async def auth_logout(request: Request, response: Response):
     tok = request.cookies.get("session_token")
     if tok:
-        await db.user_sessions.delete_many({"session_token": tok})
+        db.table("user_sessions").delete().eq("session_token", tok).execute()
     clear_auth_cookie(response)
     return {"ok": True}
 
@@ -223,10 +235,7 @@ async def listings_generate(body: GenerateRequest, request: Request):
     except Exception as e:
         log.exception("generation failed")
         # roll back the quota increment
-        await db.users.update_one(
-            {"user_id": user["user_id"]},
-            {"$inc": {"generations_used_this_period": -1}},
-        )
+        _bump_generations(user["user_id"], -1)
         raise HTTPException(status_code=502, detail=f"AI generation failed: {str(e)[:200]}")
 
     score = compute_score(gen)
@@ -237,28 +246,35 @@ async def listings_generate(body: GenerateRequest, request: Request):
         score=score,
         tone=body.tone,
     )
-    await db.listings.insert_one(listing.model_dump())
-    await _log_event(user["user_id"], "listing_generated", {"tone": body.tone})
+    db.table("listings").insert(listing.model_dump()).execute()
+    _log_event(user["user_id"], "listing_generated", {"tone": body.tone})
     return listing.model_dump()
 
 
 @api.get("/listings")
 async def listings_list(request: Request, q: Optional[str] = None):
     user = await require_user(request, db)
-    query = {"user_id": user["user_id"]}
+    query = db.table("listings").select("*").eq("user_id", user["user_id"])
     if q:
-        query["$or"] = [
-            {"generated.title": {"$regex": q, "$options": "i"}},
-            {"generated.description": {"$regex": q, "$options": "i"}},
-        ]
-    docs = await db.listings.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
+        # PostgREST or() splits on commas and treats (),. as syntax — strip them
+        # from the user term so a search string can't break the filter.
+        term = q.translate({ord(c): " " for c in ",.()"}).strip()
+        if term:
+            query = query.or_(
+                f"generated->>title.ilike.*{term}*,"
+                f"generated->>description.ilike.*{term}*"
+            )
+    docs = query.order("created_at", desc=True).limit(500).execute().data
     return docs
 
 
 @api.get("/listings/{listing_id}")
 async def listings_get(listing_id: str, request: Request):
     user = await require_user(request, db)
-    doc = await db.listings.find_one({"listing_id": listing_id, "user_id": user["user_id"]}, {"_id": 0})
+    doc = one(
+        db.table("listings").select("*")
+        .eq("listing_id", listing_id).eq("user_id", user["user_id"]).limit(1).execute()
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
     return doc
@@ -267,22 +283,31 @@ async def listings_get(listing_id: str, request: Request):
 @api.patch("/listings/{listing_id}")
 async def listings_update(listing_id: str, body: ListingUpdateRequest, request: Request):
     user = await require_user(request, db)
-    doc = await db.listings.find_one({"listing_id": listing_id, "user_id": user["user_id"]}, {"_id": 0})
+    doc = one(
+        db.table("listings").select("*")
+        .eq("listing_id", listing_id).eq("user_id", user["user_id"]).limit(1).execute()
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
     if body.generated is not None:
         doc["generated"] = body.generated.model_dump()
         doc["score"] = compute_score(body.generated).model_dump()
     doc["updated_at"] = now_utc_iso()
-    await db.listings.update_one({"listing_id": listing_id}, {"$set": doc})
+    db.table("listings").update({
+        "generated": doc["generated"],
+        "score": doc["score"],
+        "updated_at": doc["updated_at"],
+    }).eq("listing_id", listing_id).execute()
     return doc
 
 
 @api.delete("/listings/{listing_id}")
 async def listings_delete(listing_id: str, request: Request):
     user = await require_user(request, db)
-    r = await db.listings.delete_one({"listing_id": listing_id, "user_id": user["user_id"]})
-    if r.deleted_count == 0:
+    r = db.table("listings").delete().eq("listing_id", listing_id).eq(
+        "user_id", user["user_id"]
+    ).execute()
+    if not r.data:
         raise HTTPException(status_code=404, detail="Not found")
     return {"ok": True}
 
@@ -291,7 +316,10 @@ async def listings_delete(listing_id: str, request: Request):
 async def listings_duplicate(listing_id: str, request: Request):
     user = await require_user(request, db)
     await _check_library_cap(user)
-    doc = await db.listings.find_one({"listing_id": listing_id, "user_id": user["user_id"]}, {"_id": 0})
+    doc = one(
+        db.table("listings").select("*")
+        .eq("listing_id", listing_id).eq("user_id", user["user_id"]).limit(1).execute()
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
     new_doc = dict(doc)
@@ -300,8 +328,7 @@ async def listings_duplicate(listing_id: str, request: Request):
     new_doc["updated_at"] = now_utc_iso()
     if new_doc["generated"].get("title"):
         new_doc["generated"]["title"] = ("Copy — " + new_doc["generated"]["title"])[:140]
-    to_insert = dict(new_doc)
-    await db.listings.insert_one(to_insert)
+    db.table("listings").insert(dict(new_doc)).execute()
     return new_doc
 
 
@@ -309,7 +336,10 @@ async def listings_duplicate(listing_id: str, request: Request):
 async def listings_regen_field(listing_id: str, body: RegenerateFieldRequest, request: Request):
     user = await require_user(request, db)
     await _check_and_increment_quota(user)
-    doc = await db.listings.find_one({"listing_id": listing_id, "user_id": user["user_id"]}, {"_id": 0})
+    doc = one(
+        db.table("listings").select("*")
+        .eq("listing_id", listing_id).eq("user_id", user["user_id"]).limit(1).execute()
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -324,7 +354,7 @@ async def listings_regen_field(listing_id: str, body: RegenerateFieldRequest, re
             session_id=f"regen-{user['user_id']}-{uuid.uuid4().hex[:6]}",
         )
     except Exception as e:
-        await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"generations_used_this_period": -1}})
+        _bump_generations(user["user_id"], -1)
         raise HTTPException(status_code=502, detail=f"AI regeneration failed: {str(e)[:200]}")
 
     gen = doc.get("generated", {})
@@ -363,7 +393,12 @@ async def listings_regen_field(listing_id: str, body: RegenerateFieldRequest, re
     doc["score"] = compute_score(GeneratedListing(**gen)).model_dump()
     doc["tone"] = tone
     doc["updated_at"] = now_utc_iso()
-    await db.listings.update_one({"listing_id": listing_id}, {"$set": doc})
+    db.table("listings").update({
+        "generated": doc["generated"],
+        "score": doc["score"],
+        "tone": doc["tone"],
+        "updated_at": doc["updated_at"],
+    }).eq("listing_id", listing_id).execute()
     return doc
 
 
@@ -390,7 +425,7 @@ async def listings_bulk(body: BulkGenerateRequest, request: Request):
             score = compute_score(gen)
             listing = Listing(user_id=user["user_id"], input=p.model_dump(exclude={"image_base64"}),
                               generated=gen, score=score, tone=p.tone)
-            await db.listings.insert_one(listing.model_dump())
+            db.table("listings").insert(listing.model_dump()).execute()
             results.append(listing.model_dump())
         except Exception as e:
             results.append({"error": str(e)[:200], "input": p.product_description[:100]})
@@ -447,15 +482,16 @@ async def payments_checkout(body: CheckoutRequest, request: Request):
         payment_status="initiated",
         metadata=req.metadata,
     )
-    await db.payment_transactions.insert_one(txn.model_dump())
+    db.table("payment_transactions").insert(txn.model_dump()).execute()
     return {"url": session.url, "session_id": session.session_id}
 
 
 @api.get("/payments/status/{session_id}")
 async def payments_status(session_id: str, request: Request):
     user = await require_user(request, db)
-    txn = await db.payment_transactions.find_one(
-        {"session_id": session_id, "user_id": user["user_id"]}, {"_id": 0}
+    txn = one(
+        db.table("payment_transactions").select("*")
+        .eq("session_id", session_id).eq("user_id", user["user_id"]).limit(1).execute()
     )
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found.")
@@ -477,25 +513,21 @@ async def payments_status(session_id: str, request: Request):
     elif session_state == "expired":
         final_status = "expired"
 
-    await db.payment_transactions.update_one(
-        {"session_id": session_id},
-        {"$set": {"payment_status": final_status, "updated_at": now_utc_iso()}},
-    )
+    db.table("payment_transactions").update(
+        {"payment_status": final_status, "updated_at": now_utc_iso()}
+    ).eq("session_id", session_id).execute()
 
     if final_status == "paid":
         pkg = PACKAGES.get(txn["package_id"])
         if pkg:
             new_expiry = compute_new_expiry(user.get("plan_expires_at"), pkg["days"])
-            await db.users.update_one(
-                {"user_id": user["user_id"]},
-                {"$set": {
-                    "plan": pkg["plan"],
-                    "plan_expires_at": new_expiry,
-                    "generations_used_this_period": 0,
-                    "period_start": now_utc_iso(),
-                }},
-            )
-            await _log_event(user["user_id"], "upgrade", {"package": txn["package_id"]})
+            db.table("users").update({
+                "plan": pkg["plan"],
+                "plan_expires_at": new_expiry,
+                "generations_used_this_period": 0,
+                "period_start": now_utc_iso(),
+            }).eq("user_id", user["user_id"]).execute()
+            _log_event(user["user_id"], "upgrade", {"package": txn["package_id"]})
 
     return {"payment_status": final_status, "status": session_state}
 
@@ -512,36 +544,39 @@ async def stripe_webhook(request: Request):
         log.warning(f"webhook parse failed: {e}")
         return {"ok": False}
     if evt.event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
-        txn = await db.payment_transactions.find_one({"session_id": evt.session_id}, {"_id": 0})
+        txn = one(
+            db.table("payment_transactions").select("*")
+            .eq("session_id", evt.session_id).limit(1).execute()
+        )
         if txn and txn["payment_status"] != "paid" and evt.payment_status == "paid":
             pkg = PACKAGES.get(txn["package_id"])
             if pkg:
-                user = await db.users.find_one({"user_id": txn["user_id"]}, {"_id": 0})
-                new_expiry = compute_new_expiry(user.get("plan_expires_at") if user else None, pkg["days"])
-                await db.users.update_one(
-                    {"user_id": txn["user_id"]},
-                    {"$set": {"plan": pkg["plan"], "plan_expires_at": new_expiry,
-                              "generations_used_this_period": 0, "period_start": now_utc_iso()}},
+                user = one(
+                    db.table("users").select("*").eq("user_id", txn["user_id"]).limit(1).execute()
                 )
-            await db.payment_transactions.update_one(
-                {"session_id": evt.session_id},
-                {"$set": {"payment_status": "paid", "updated_at": now_utc_iso()}},
-            )
+                new_expiry = compute_new_expiry(user.get("plan_expires_at") if user else None, pkg["days"])
+                db.table("users").update({
+                    "plan": pkg["plan"], "plan_expires_at": new_expiry,
+                    "generations_used_this_period": 0, "period_start": now_utc_iso(),
+                }).eq("user_id", txn["user_id"]).execute()
+            db.table("payment_transactions").update(
+                {"payment_status": "paid", "updated_at": now_utc_iso()}
+            ).eq("session_id", evt.session_id).execute()
     return {"ok": True}
 
 
 # =========================================================
 # ANALYTICS
 # =========================================================
-async def _log_event(user_id: Optional[str], event_type: str, meta: dict):
+def _log_event(user_id: Optional[str], event_type: str, meta: dict):
     e = AnalyticsEvent(user_id=user_id, event_type=event_type, metadata=meta)
-    await db.analytics_events.insert_one(e.model_dump())
+    db.table("analytics_events").insert(e.model_dump()).execute()
 
 
 @api.post("/analytics/event")
 async def analytics_event(body: AnalyticsEventRequest, request: Request):
     user = await get_current_user_optional(request, db)
-    await _log_event(user["user_id"] if user else None, body.event_type, body.metadata)
+    _log_event(user["user_id"] if user else None, body.event_type, body.metadata)
     return {"ok": True}
 
 
@@ -556,30 +591,36 @@ async def analytics_funnel(request: Request, days: int = 30):
     await require_user(request, db)
     since = (datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))).isoformat()
 
-    pipeline = [
-        {"$match": {
-            "event_type": {"$in": ["publish_started", "publish_completed"]},
-            "created_at": {"$gte": since},
-        }},
-        {"$lookup": {
-            "from": "users", "localField": "user_id", "foreignField": "user_id", "as": "u",
-        }},
-        {"$addFields": {"plan": {"$ifNull": [{"$arrayElemAt": ["$u.plan", 0]}, "anonymous"]}}},
-        {"$group": {
-            "_id": {"plan": "$plan", "event": "$event_type"},
-            "count": {"$sum": 1},
-        }},
-    ]
-    rows = await db.analytics_events.aggregate(pipeline).to_list(1000)
+    # Mongo did a $lookup(users) + $group. PostgREST has no ad-hoc join, so we fetch
+    # the matching events, resolve each event's user plan, and group in Python.
+    # Events with no (or an unmatched) user_id count as "anonymous", mirroring the
+    # original $ifNull default.
+    events = (
+        db.table("analytics_events").select("user_id,event_type")
+        .in_("event_type", ["publish_started", "publish_completed"])
+        .gte("created_at", since)
+        .limit(100000)
+        .execute()
+        .data
+    )
+
+    user_ids = {e["user_id"] for e in events if e.get("user_id")}
+    plan_by_user: dict = {}
+    if user_ids:
+        urows = (
+            db.table("users").select("user_id,plan")
+            .in_("user_id", list(user_ids)).execute().data
+        )
+        plan_by_user = {u["user_id"]: u.get("plan") for u in urows}
 
     # Collapse into {plan: {started, completed, rate}}
     by_plan: dict = {}
-    for r in rows:
-        plan = r["_id"]["plan"]
-        evt = r["_id"]["event"]
+    for e in events:
+        uid = e.get("user_id")
+        plan = plan_by_user.get(uid, "anonymous") if uid else "anonymous"
         by_plan.setdefault(plan, {"started": 0, "completed": 0})
-        key = "started" if evt == "publish_started" else "completed"
-        by_plan[plan][key] = r["count"]
+        key = "started" if e["event_type"] == "publish_started" else "completed"
+        by_plan[plan][key] += 1
 
     for plan, v in by_plan.items():
         v["rate"] = round(v["completed"] / v["started"], 3) if v["started"] else 0.0
@@ -608,8 +649,3 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
